@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>محاكاة الطيران 2D</title>
+<style>
+:root{--bg:#f4f6f8;--fg:#14202b;--sky:#dfeaf5;--plane:#1d5fd1;--sel:#e0561b;
+  box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0e141b;--fg:#e6edf3;--sky:#16222f;--plane:#5aa2ff;--sel:#ff8a4c}}
+:root[data-theme="dark"]{--bg:#0e141b;--fg:#e6edf3;--sky:#16222f;--plane:#5aa2ff;--sel:#ff8a4c}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;display:flex;flex-direction:column}
+header{display:flex;gap:8px;align-items:center;padding:10px 12px;flex-wrap:wrap}
+button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid currentColor;background:transparent;color:inherit}
+small{opacity:.75;flex-basis:100%}
+canvas{flex:1;width:100%;min-height:0;background:var(--sky);touch-action:none}
+details{padding:0 12px 8px}
+summary{cursor:pointer;padding:6px 0}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+input{width:64px;font:inherit;padding:6px;border-radius:6px;border:1px solid currentColor;background:transparent;color:inherit}
+#results{overflow-x:auto}
+table{border-collapse:collapse;margin-top:8px;font-size:14px}
+th,td{border:1px solid color-mix(in srgb,currentColor 30%,transparent);padding:4px 8px;text-align:center;white-space:nowrap}
+</style>
+</head>
+<body>
+<header>
+  <button id="add">+ طائرة</button>
+  <button id="addDrone">+ مسيّرة</button>
+  <button id="pause">إيقاف</button>
+  <button id="avoid">تفادي: تنبؤي</button>
+  <button id="reset">تصفير العدّاد</button>
+  <span id="stats"></span>
+  <small>اضغط على طائرة لتحديدها، ثم اضغط في أي مكان لتحديد وجهتها.</small>
+</header>
+<details id="exp">
+  <summary>وضع التجارب (مقارنة بتفادٍ وبدونه)</summary>
+  <div class="row">
+    <label>طائرات <input id="nPlanes" type="number" value="3" min="0" max="30"></label>
+    <label>مسيّرات <input id="nDrones" type="number" value="8" min="0" max="60"></label>
+    <label>المدة (ث) <input id="secs" type="number" value="60" min="10" max="600"></label>
+    <label>التكرارات <input id="runs" type="number" value="5" min="1" max="50"></label>
+    <button id="runExp">مقارنة الأنماط</button>
+    <button id="runDensity">تجربة الازدحام</button>
+    <button id="copyCsv">نسخ CSV</button>
+  </div>
+  <div id="results"></div>
+</details>
+<canvas id="c"></canvas>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W = 0, H = 0, paused = false, selected = null;
+const planes = [];
+let avoidMode = 2;       // 0 = بدون تفادٍ، 1 = حسب المسافة، 2 = تنبؤي (يتوقع أقرب اقتراب)
+const MODE_NAMES = ['بدون تفادٍ', 'حسب المسافة', 'تنبؤي'];
+const MODE_EN = ['off', 'distance', 'predictive'];
+const AVOID = 110;       // مسافة بدء التفادي في النمط 1 (بكسل)
+const AVOID_FORCE = 3;   // قوة الابتعاد: كلما زادت، انحرف أكثر
+const LOOKAHEAD = 4;     // النمط 2: كم ثانية نتوقع للأمام
+const SAFE = 55;         // النمط 2: الفاصل الآمن المطلوب عند أقرب اقتراب متوقع (بكسل)
+let rng = Math.random;   // مولّد عشوائي قابل للاستبدال بمولّد ببذرة ثابتة (للتجارب)
+const rand = (a, b) => a + rng() * (b - a);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function resize() {
+  const r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+  cv.width = r.width * d; cv.height = r.height * d;
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  W = r.width; H = r.height;
+}
+addEventListener('resize', resize);
+
+class Plane {
+  constructor(type = 'plane') {
+    this.type = type; this.wait = 0; this.reached = 0;       // النوع: plane أو drone
+    this.x = rand(0, W); this.y = rand(0, H);
+    this.heading = rand(0, Math.PI * 2);   // الاتجاه بالراديان
+    const drone = type === 'drone';
+    this.speed = drone ? rand(30, 50) : rand(70, 110);  // بكسل/ثانية
+    this.turnRate = drone ? 5 : 1.2;       // أقصى دوران راديان/ثانية
+    this.trail = [];
+    this.newTarget();
+  }
+  newTarget() { this.tx = rand(30, W - 30); this.ty = rand(30, H - 30); }
+  update(dt, others) {
+    // اتجاه الوجهة كمتجه وحدة
+    let vx = this.tx - this.x, vy = this.ty - this.y;
+    const dist = Math.hypot(vx, vy) || 1;
+    vx /= dist; vy /= dist;
+    if (avoidMode > 0) {
+      const mvx = this.wait > 0 ? 0 : Math.cos(this.heading) * this.speed;   // سرعتي
+      const mvy = this.wait > 0 ? 0 : Math.sin(this.heading) * this.speed;
+      for (const o of others) {
+        if (o === this) continue;
+        const dx = this.x - o.x, dy = this.y - o.y, d = Math.hypot(dx, dy);
+        if (avoidMode === 1) {
+          // النمط 1: دفع بسيط يعتمد على المسافة الحالية فقط
+          if (d > 0 && d < AVOID) {
+            const w = (AVOID - d) / AVOID * AVOID_FORCE;
+            vx += (dx / d) * w; vy += (dy / d) * w;
+          }
+        } else {
+          // النمط 2: نتوقع أقرب اقتراب بيننا إن استمر كلٌّ في اتجاهه
+          const rx = o.x - this.x, ry = o.y - this.y;                          // موضعه نسبةً لي
+          const ovx = o.wait > 0 ? 0 : Math.cos(o.heading) * o.speed;
+          const ovy = o.wait > 0 ? 0 : Math.sin(o.heading) * o.speed;
+          const rvx = ovx - mvx, rvy = ovy - mvy;                              // سرعته النسبية
+          const vv = rvx * rvx + rvy * rvy;
+          let t = vv > 1e-6 ? -(rx * rvx + ry * rvy) / vv : 0;                 // زمن أقرب اقتراب
+          t = Math.max(0, Math.min(LOOKAHEAD, t));
+          const cx = rx + rvx * t, cy = ry + rvy * t, cd = Math.hypot(cx, cy); // الفاصل المتوقع
+          if (cd < SAFE) {
+            const urgency = 1 - t / LOOKAHEAD;       // كلما اقترب الخطر زمنياً زاد الدفع
+            const gap = 1 - cd / SAFE;               // وكلما قلّ الفاصل المتوقع زاد الدفع
+            const w = AVOID_FORCE * (0.3 + 0.7 * urgency) * (0.3 + 0.7 * gap);
+            // اتجاه الابتعاد: بعيداً عن موضعه المتوقع؛ وإن تطابقنا نحيد جانباً
+            const ax = cd > 1e-3 ? -cx / cd : -Math.sin(this.heading);
+            const ay = cd > 1e-3 ? -cy / cd : Math.cos(this.heading);
+            vx += ax * w; vy += ay * w;
+          }
+        }
+      }
+    }
+    const want = Math.atan2(vy, vx);   // الاتجاه المطلوب بعد دمج الوجهة والتفادي
+    let diff = want - this.heading;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff));            // تطبيع الزاوية
+    const maxTurn = this.turnRate * dt;
+    this.heading += Math.max(-maxTurn, Math.min(maxTurn, diff));  // دوران تدريجي
+    if (this.wait > 0) { this.wait -= dt; return; }   // المسيّرة تحوم في مكانها
+    this.x += Math.cos(this.heading) * this.speed * dt;
+    this.y += Math.sin(this.heading) * this.speed * dt;
+    if (Math.hypot(this.tx - this.x, this.ty - this.y) < 14) {
+      this.reached++;                       // عدّاد الوجهات التي بلغها
+      if (this.type === 'drone') this.wait = 1.5;
+      this.newTarget();
+    }
+    this.trail.push([this.x, this.y]);
+    if (this.trail.length > 70) this.trail.shift();
+  }
+  draw(isSel) {
+    const c = isSel ? css('--sel') : css('--plane');
+    ctx.strokeStyle = c; ctx.globalAlpha = .35; ctx.lineWidth = 2; ctx.beginPath();
+    this.trail.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+    ctx.stroke(); ctx.globalAlpha = 1;
+    if (isSel) {                                                  // علامة الوجهة
+      ctx.beginPath(); ctx.arc(this.tx, this.ty, 8, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.save(); ctx.translate(this.x, this.y); ctx.rotate(this.heading);
+    ctx.fillStyle = c; ctx.strokeStyle = c; ctx.lineWidth = 2;
+    if (this.type === 'drone') {            // مسيّرة رباعية: ذراعان + 4 مراوح
+      ctx.beginPath();
+      ctx.moveTo(-8, -8); ctx.lineTo(8, 8); ctx.moveTo(8, -8); ctx.lineTo(-8, 8); ctx.stroke();
+      ctx.beginPath(); ctx.arc(0, 0, 3, 0, Math.PI * 2); ctx.fill();
+      for (const [dx, dy] of [[-8, -8], [8, -8], [-8, 8], [8, 8]]) {
+        ctx.beginPath(); ctx.arc(dx, dy, 4, 0, Math.PI * 2); ctx.stroke();
+      }
+      ctx.fillRect(4, -1.5, 7, 3);          // مقدمة المسيّرة
+    } else {                                // طائرة: مثلث بسيط
+      ctx.beginPath();
+      ctx.moveTo(14, 0); ctx.lineTo(-10, -8); ctx.lineTo(-5, 0); ctx.lineTo(-10, 8);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+cv.addEventListener('pointerdown', e => {
+  const r = cv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  const hit = planes.find(p => Math.hypot(p.x - x, p.y - y) < 24);
+  if (hit) selected = hit;
+  else if (selected) { selected.tx = x; selected.ty = y; }
+});
+document.getElementById('add').onclick = () => planes.push(new Plane('plane'));
+document.getElementById('addDrone').onclick = () => planes.push(new Plane('drone'));
+document.getElementById('pause').onclick = e => {
+  paused = !paused; e.target.textContent = paused ? 'تشغيل' : 'إيقاف';
+};
+
+const stats = document.getElementById('stats');
+const $ = id => document.getElementById(id);
+
+$('avoid').onclick = e => {
+  avoidMode = (avoidMode + 1) % 3;
+  e.target.textContent = 'تفادي: ' + MODE_NAMES[avoidMode];
+};
+$('reset').onclick = () => { live = newMetrics(); planes.forEach(p => p.reached = 0); };
+
+// ===== المقاييس وكشف الاقتراب =====
+const WARN = 70, CRASH = 20;   // مسافة الاقتراب / التصادم (بكسل)
+
+function newMetrics() {
+  return { crashes: 0, nearMiss: 0, minDist: Infinity, warnNow: 0,
+           prevWarn: new Set(), prevCrash: new Set(), pairs: [] };
+}
+
+// يفحص كل زوج ويحدّث المقاييس (لا يرسم شيئاً، لذلك يصلح للتجارب أيضاً)
+function scan(list, m) {
+  const nowWarn = new Set(), nowCrash = new Set();
+  m.pairs = []; m.warnNow = 0;
+  for (let i = 0; i < list.length; i++) {
+    for (let j = i + 1; j < list.length; j++) {
+      const a = list[i], b = list[j], d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (d < m.minDist) m.minDist = d;          // أقرب مسافة وصل إليها أي زوجين
+      if (d > WARN) continue;
+      const key = i + '-' + j, crash = d < CRASH;
+      m.pairs.push([a, b, crash]);
+      nowWarn.add(key);
+      if (!m.prevWarn.has(key)) m.nearMiss++;    // حالة اقتراب جديدة
+      if (crash) {
+        nowCrash.add(key);
+        if (!m.prevCrash.has(key)) m.crashes++;  // تصادم جديد (يُعدّ مرة واحدة)
+      } else m.warnNow++;
+    }
+  }
+  m.prevWarn = nowWarn; m.prevCrash = nowCrash;
+}
+
+function drawConflicts(m) {
+  ctx.lineWidth = 2;
+  for (const [a, b, crash] of m.pairs) {
+    ctx.strokeStyle = crash ? '#e5484d' : '#f5a524';
+    ctx.setLineDash(crash ? [] : [5, 5]);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.setLineDash([]);
+    if (crash) { ctx.beginPath(); ctx.arc((a.x + b.x) / 2, (a.y + b.y) / 2, 18, 0, Math.PI * 2); ctx.stroke(); }
+  }
+}
+
+let live = newMetrics();
+function showStats() {
+  const reached = planes.reduce((n, p) => n + p.reached, 0);
+  stats.textContent = 'تحذيرات: ' + live.warnNow + ' | اقتراب: ' + live.nearMiss +
+                      ' | تصادمات: ' + live.crashes + ' | وجهات: ' + reached;
+}
+
+// ===== وضع التجارب =====
+// مولّد أرقام عشوائية ببذرة ثابتة: نفس البذرة = نفس نقطة البداية في الحالتين
+function mulberry32(a) {
+  return () => {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function runOnce(seed, mode, nPlanes, nDrones, seconds) {
+  const savedRng = rng, savedMode = avoidMode;
+  rng = mulberry32(seed); avoidMode = mode;
+  const fleet = [];
+  for (let i = 0; i < nPlanes; i++) fleet.push(new Plane('plane'));
+  for (let i = 0; i < nDrones; i++) fleet.push(new Plane('drone'));
+  const m = newMetrics(), steps = Math.round(seconds * 60);
+  for (let s = 0; s < steps; s++) {              // 60 خطوة في الثانية بدون رسم
+    for (const p of fleet) p.update(1 / 60, fleet);
+    scan(fleet, m);
+  }
+  rng = savedRng; avoidMode = savedMode;
+  return { crashes: m.crashes, nearMiss: m.nearMiss,
+           reached: fleet.reduce((n, p) => n + p.reached, 0),
+           minDist: m.minDist === Infinity ? 0 : m.minDist };
+}
+
+const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
+const sd = a => { const m = mean(a); return Math.sqrt(a.reduce((x, y) => x + (y - m) ** 2, 0) / Math.max(a.length - 1, 1)); };
+const fmt = a => mean(a).toFixed(1) + ' ± ' + sd(a).toFixed(1);
+let lastExport = { header: '', lines: [] };   // آخر نتائج لتصديرها كـ CSV
+
+const readInputs = () => {
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.round(+v || lo)));
+  return { nP: clamp($('nPlanes').value, 0, 30), nD: clamp($('nDrones').value, 0, 60),
+           sec: clamp($('secs').value, 10, 600), runs: clamp($('runs').value, 1, 50) };
+};
+const busy = (btn, work) => {
+  const label = btn.textContent; btn.textContent = 'جارٍ التشغيل...'; btn.disabled = true;
+  setTimeout(() => { work(); btn.textContent = label; btn.disabled = false; }, 30);  // ليظهر نص الزر قبل الحساب
+};
+
+// تجربة 1: مقارنة الأنماط الثلاثة بنفس السيناريو
+$('runExp').onclick = e => busy(e.target, () => {
+  const { nP, nD, sec, runs } = readInputs();
+  const rows = [];
+  for (let seed = 1; seed <= runs; seed++)
+    for (const mode of [0, 1, 2]) rows.push({ seed, mode, ...runOnce(seed, mode, nP, nD, sec) });
+
+  const metrics = [['crashes', 'تصادمات'], ['nearMiss', 'حالات اقتراب'],
+                   ['reached', 'وجهات تم بلوغها'], ['minDist', 'أقرب مسافة (بكسل)']];
+  let html = '<p>المنطقة: ' + Math.round(W) + '×' + Math.round(H) + ' بكسل | طائرات: ' + nP + ' | مسيّرات: ' + nD +
+             ' | ' + sec + ' ث × ' + runs + ' تكرارات (المتوسط ± الانحراف المعياري)</p>' +
+             '<table><tr><th>المقياس</th>' + MODE_NAMES.map(n => '<th>' + n + '</th>').join('') + '</tr>';
+  for (const [k, label] of metrics) {
+    const cols = [0, 1, 2].map(m => rows.filter(r => r.mode === m).map(r => r[k]));
+    html += '<tr><td>' + label + '</td>' + cols.map(c => '<td>' + fmt(c) + '</td>').join('') + '</tr>';
+  }
+  $('results').innerHTML = html + '</table>';
+  lastExport = { header: 'seed,mode,crashes,nearMiss,reached,minDist',
+    lines: rows.map(r => [r.seed, MODE_EN[r.mode], r.crashes, r.nearMiss, r.reached, r.minDist.toFixed(2)].join(',')) };
+});
+
+// تجربة 2: أثر الازدحام (يتغير العدد الكلي، 30% طائرات و70% مسيّرات)
+$('runDensity').onclick = e => busy(e.target, () => {
+  const { sec, runs } = readInputs();
+  const counts = [6, 12, 18, 24, 30], lines = [];
+  let html = '<p>المنطقة: ' + Math.round(W) + '×' + Math.round(H) + ' بكسل | ' + sec + ' ث × ' + runs +
+             ' تكرارات | 30% طائرات و70% مسيّرات (المتوسط)</p><table><tr><th>العدد الكلي</th>' +
+             MODE_NAMES.map(n => '<th>تصادمات: ' + n + '</th>').join('') +
+             MODE_NAMES.map(n => '<th>وجهات: ' + n + '</th>').join('') + '</tr>';
+  for (const n of counts) {
+    const nP = Math.round(n * 0.3), nD = n - nP, res = [[], [], []];
+    for (let seed = 1; seed <= runs; seed++)
+      for (const mode of [0, 1, 2]) {
+        const r = runOnce(seed, mode, nP, nD, sec);
+        res[mode].push(r);
+        lines.push([n, seed, MODE_EN[mode], r.crashes, r.nearMiss, r.reached, r.minDist.toFixed(2)].join(','));
+      }
+    html += '<tr><td>' + n + '</td>' + res.map(a => '<td>' + mean(a.map(r => r.crashes)).toFixed(1) + '</td>').join('') +
+            res.map(a => '<td>' + mean(a.map(r => r.reached)).toFixed(1) + '</td>').join('') + '</tr>';
+  }
+  $('results').innerHTML = html + '</table>';
+  lastExport = { header: 'count,seed,mode,crashes,nearMiss,reached,minDist', lines };
+});
+
+$('copyCsv').onclick = e => {
+  if (!lastExport.lines.length) { e.target.textContent = 'شغّل تجربة أولاً'; return; }
+  const csv = lastExport.header + '\n' + lastExport.lines.join('\n');
+  const done = () => { e.target.textContent = 'تم النسخ'; setTimeout(() => e.target.textContent = 'نسخ CSV', 1500); };
+  if (navigator.clipboard) navigator.clipboard.writeText(csv).then(done, () => fallbackCopy(csv, done));
+  else fallbackCopy(csv, done);
+};
+function fallbackCopy(text, done) {
+  const t = document.createElement('textarea'); t.value = text; document.body.appendChild(t);
+  t.select(); document.execCommand('copy'); t.remove(); done();
+}
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05); last = now;
+  ctx.clearRect(0, 0, W, H);
+  for (const p of planes) { if (!paused) p.update(dt, planes); p.draw(p === selected); }
+  scan(planes, live); drawConflicts(live); showStats();
+  requestAnimationFrame(loop);
+}
+resize();
+for (let i = 0; i < 2; i++) planes.push(new Plane('plane'));
+for (let i = 0; i < 3; i++) planes.push(new Plane('drone'));
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
