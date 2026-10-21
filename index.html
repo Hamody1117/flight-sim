@@ -93,6 +93,7 @@ footer{padding:10px 12px 16px;font-size:12px;opacity:.7}
     <button id="runExp">مقارنة الأنماط</button>
     <button id="runDensity">تجربة الازدحام</button>
     <button id="runSens">تحليل الحساسية</button>
+    <button id="runPred">دقة التنبؤ والكشف</button>
     <button id="dlCsv">تنزيل CSV</button>
     <button id="copyCsv">نسخ CSV</button>
   </div>
@@ -113,6 +114,11 @@ footer{padding:10px 12px 16px;font-size:12px;opacity:.7}
   <p id="scnNote"></p>
   <div id="scnResults"></div>
 </details>
+<details id="tests">
+  <summary>اختبارات التحقق الآلية</summary>
+  <div class="row"><button id="runTests">شغّل الاختبارات</button><span id="testSummary"></span></div>
+  <div id="testResults"></div>
+</details>
 <details id="specs">
   <summary>مواصفات الطرازات الواقعية ومصادرها</summary>
   <p>عند اختيار طراز واقعي تتحرك المركبة بوحدات حقيقية (متر وثانية)، ويتحدد دورانها بمعادلة الدوران المنسّق: <b>معدل الدوران = g × tan(زاوية الميل) ÷ السرعة</b>. الطراز «عام» هو النموذج المبسّط السابق (وهو المستخدم في كل التجارب والسيناريوهات).</p>
@@ -122,6 +128,7 @@ footer{padding:10px 12px 16px;font-size:12px;opacity:.7}
     <tr><td>DJI Mavic 3 Enterprise</td><td>9 م/ث (سرعة قياس الاستمرارية 32.4 كم/س)، والأقصى 21 م/ث</td><td>ميل أقصى 30°، ومعدل دوران أقصى 200°/ث</td><td>ورقة مواصفات DJI Mavic 3 Enterprise</td></tr>
   </table>
   <p><b>معايير الفصل (للطرازات الواقعية):</b> NMAC = 500 قدم (≈ 153 م) أفقياً، وفقدان الفصل الآمن LoWC = 2000 قدم (≈ 610 م). المصدر: وثائق PX4 (تطبيق ASTM F3442) ووثائق NASA/FAA.</p>
+  <p><b>ORCA:</b> النمط الرابع مبني على خوارزمية التفادي المتبادل الأمثل (RVO2، جامعة نورث كارولاينا، ترخيص Apache-2.0): كل مركبة تحسب السرعات الممنوعة وتختار أقربها إلى مرادها، وتتقاسم مع جارها مسؤولية التفادي. استعملنا اتجاه السرعة الناتجة فقط لأن سرعات مركباتنا ثابتة وحدّ دورانها محدود.</p>
   <p><b>افتراضات منا (ليست من مصدر):</b> أفق التنبؤ 45 ثانية، ونسبة الفاصل الآمن 0.79 من مسافة LoWC، والمقياس 8 م/بكسل مع تسريع ×10، والمحاكاة ببعدين (المعايير الحقيقية تشمل فصلاً رأسياً أيضاً).</p>
 </details>
 <details id="loc">
@@ -140,8 +147,9 @@ const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 let W = 0, H = 0, paused = false, selected = null;
 const planes = [];
 let avoidMode = 2;       // 0 = بدون تفادٍ، 1 = حسب المسافة، 2 = تنبؤي (يتوقع أقرب اقتراب)
-const MODE_NAMES = ['بدون تفادٍ', 'حسب المسافة', 'تنبؤي'];
-const MODE_EN = ['off', 'distance', 'predictive'];
+const MODE_NAMES = ['بدون تفادٍ', 'حسب المسافة', 'تنبؤي', 'ORCA'];
+const ALL_MODES = [0, 1, 2, 3];
+const MODE_EN = ['off', 'distance', 'predictive', 'orca'];
 const AVOID = 110;       // مسافة بدء التفادي في النمط 1 (بكسل)
 const AVOID_FORCE = 3;   // قوة الابتعاد: كلما زادت، انحرف أكثر
 let LOOKAHEAD = 4;     // النمط 2: كم ثانية نتوقع للأمام
@@ -170,6 +178,110 @@ const PROFILES = {
   c172:   { label: 'Cessna 172S', type: 'plane', cruiseMps: 124 * KT, rateMax: 3 * DEG, bankMax: 25 * DEG },
   mavic3: { label: 'DJI Mavic 3 Enterprise', type: 'drone', cruiseMps: 9, tiltMax: 30 * DEG, yawMax: 200 * DEG },
 };
+
+// ===== ORCA: التفادي المتبادل الأمثل (خوارزمية RVO2: van den Berg وآخرون، جامعة نورث كارولاينا) =====
+// الفكرة: كل مركبة تحسب لكل جار «السرعات الممنوعة» التي تؤدي إلى اقتراب أقل من الفاصل المطلوب خلال زمن الأفق،
+// وتتقاسم مع الجار مسؤولية التفادي (0.5 لكل منهما)، ثم تختار أقرب سرعة مسموحة إلى السرعة التي تريدها.
+// تكيّف لنموذجنا: سرعة المركبات ثابتة وحدّ دورانها محدود، فنستعمل اتجاه السرعة الناتجة فقط.
+const ORCA_EPS = 1e-5;
+
+function orcaLP1(lines, i, R, ox, oy, dirOpt, res) {      // البرنامج الخطي على خط واحد
+  const L = lines[i], dot = L.px * L.dx + L.py * L.dy;
+  const disc = dot * dot + R * R - (L.px * L.px + L.py * L.py);
+  if (disc < 0) return false;
+  const sq = Math.sqrt(disc);
+  let tL = -dot - sq, tR = -dot + sq;
+  for (let j = 0; j < i; j++) {
+    const M = lines[j];
+    const den = L.dx * M.dy - L.dy * M.dx;
+    const num = M.dx * (L.py - M.py) - M.dy * (L.px - M.px);
+    if (Math.abs(den) <= ORCA_EPS) { if (num < 0) return false; continue; }
+    const t = num / den;
+    if (den >= 0) tR = Math.min(tR, t); else tL = Math.max(tL, t);
+    if (tL > tR) return false;
+  }
+  let t;
+  if (dirOpt) t = (ox * L.dx + oy * L.dy > 0) ? tR : tL;
+  else { t = L.dx * (ox - L.px) + L.dy * (oy - L.py); t = Math.max(tL, Math.min(tR, t)); }
+  res[0] = L.px + t * L.dx; res[1] = L.py + t * L.dy;
+  return true;
+}
+function orcaLP2(lines, R, ox, oy, dirOpt, res) {         // البرنامج الخطي في دائرة أقصى سرعة
+  if (dirOpt) { res[0] = ox * R; res[1] = oy * R; }
+  else if (ox * ox + oy * oy > R * R) { const n = Math.hypot(ox, oy); res[0] = ox / n * R; res[1] = oy / n * R; }
+  else { res[0] = ox; res[1] = oy; }
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i];
+    if (L.dx * (L.py - res[1]) - L.dy * (L.px - res[0]) > 0) {          // القيد غير محقق
+      const tx = res[0], ty = res[1];
+      if (!orcaLP1(lines, i, R, ox, oy, dirOpt, res)) { res[0] = tx; res[1] = ty; return i; }
+    }
+  }
+  return lines.length;
+}
+function orcaLP3(lines, begin, R, res) {                  // إن استحال تحقيق كل القيود: أقل انتهاك ممكن
+  let distance = 0;
+  for (let i = begin; i < lines.length; i++) {
+    const L = lines[i];
+    if (L.dx * (L.py - res[1]) - L.dy * (L.px - res[0]) > distance) {
+      const proj = [];
+      for (let j = 0; j < i; j++) {
+        const M = lines[j], d = L.dx * M.dy - L.dy * M.dx;
+        let px, py;
+        if (Math.abs(d) <= ORCA_EPS) {
+          if (L.dx * M.dx + L.dy * M.dy > 0) continue;
+          px = 0.5 * (L.px + M.px); py = 0.5 * (L.py + M.py);
+        } else {
+          const t = (M.dx * (L.py - M.py) - M.dy * (L.px - M.px)) / d;
+          px = L.px + t * L.dx; py = L.py + t * L.dy;
+        }
+        const nx = M.dx - L.dx, ny = M.dy - L.dy, nl = Math.hypot(nx, ny) || 1;
+        proj.push({ px, py, dx: nx / nl, dy: ny / nl });
+      }
+      const tx = res[0], ty = res[1];
+      if (orcaLP2(proj, R, -L.dy, L.dx, true, res) < proj.length) { res[0] = tx; res[1] = ty; }
+      distance = L.dx * (L.py - res[1]) - L.dy * (L.px - res[0]);
+    }
+  }
+}
+// يعيد السرعة الجديدة [vx, vy] بالبكسل/ث (أو null إن لم يوجد جيران). prefX/prefY: الاتجاه المطلوب (وحدة).
+function orcaVelocity(me, others, dt, prefX, prefY) {
+  const lines = [], mvx = me.cvx, mvy = me.cvy;
+  for (const o of others) {
+    if (o === me) continue;
+    const ph = me.phys && o.phys;
+    const R = ph ? SAFE_RATIO * LOWC_M / MPP : SAFE, tau = ph ? LOOKAHEAD_PHYS : LOOKAHEAD;   // الفاصل المشترك وأفق التنبؤ
+    const rpx = o.x - me.x, rpy = o.y - me.y, rvx = mvx - o.cvx, rvy = mvy - o.cvy;
+    const d2 = rpx * rpx + rpy * rpy, R2 = R * R;
+    let dx, dy, ux, uy;
+    if (d2 > R2) {                                       // لا تصادم حالي: نسقط على دائرة القطع أو على «الظل»
+      const wx = rvx - rpx / tau, wy = rvy - rpy / tau, w2 = wx * wx + wy * wy, dot = wx * rpx + wy * rpy;
+      if (dot < 0 && dot * dot > R2 * w2) {
+        const w = Math.sqrt(w2) || 1e-9, nx = wx / w, ny = wy / w;
+        dx = ny; dy = -nx;
+        const k = R / tau - w; ux = k * nx; uy = k * ny;
+      } else {
+        const leg = Math.sqrt(d2 - R2);
+        if (rpx * wy - rpy * wx > 0) { dx = (rpx * leg - rpy * R) / d2; dy = (rpx * R + rpy * leg) / d2; }
+        else { dx = -(rpx * leg + rpy * R) / d2; dy = -(-rpx * R + rpy * leg) / d2; }
+        const dp = rvx * dx + rvy * dy;
+        ux = dp * dx - rvx; uy = dp * dy - rvy;
+      }
+    } else {                                             // داخل الفاصل المطلوب: نخرج منه خلال خطوة واحدة
+      const it = 1 / dt, wx = rvx - it * rpx, wy = rvy - it * rpy, w = Math.sqrt(wx * wx + wy * wy) || 1e-9;
+      const nx = wx / w, ny = wy / w;
+      dx = ny; dy = -nx;
+      const k = R * it - w; ux = k * nx; uy = k * ny;
+    }
+    const resp = o.wait > 0 ? 1 : 0.5;                   // الجار المحوِّم لا يتفادى: نتحمل المسؤولية كاملة
+    lines.push({ px: mvx + resp * ux, py: mvy + resp * uy, dx, dy });
+  }
+  if (!lines.length) return null;
+  const res = [0, 0], maxS = me.speed;
+  const fail = orcaLP2(lines, maxS, prefX * maxS, prefY * maxS, false, res);
+  if (fail < lines.length) orcaLP3(lines, fail, maxS, res);
+  return res;
+}
 
 // شكل طائرة بمنظر علوي (المقدمة نحو +x): جسم، وجناحان مائلان للخلف، وذيل
 const PLANE_PATH = new Path2D('M17 0 L14 1.8 L6 2 L-3 15 L-7 15 L-4 2.2 L-10 1.8 L-14 6.5 L-16.5 6.5 L-14.5 1.2 L-16 0.9 L-16 -0.9 L-14.5 -1.2 L-16.5 -6.5 L-14 -6.5 L-10 -1.8 L-4 -2.2 L-7 -15 L-3 -15 L6 -2 L14 -1.8 Z');
@@ -211,7 +323,7 @@ class Plane {
     let vx = this.tx - this.x, vy = this.ty - this.y;
     const dist = Math.sqrt(vx * vx + vy * vy) || 1;
     vx /= dist; vy /= dist;
-    if (avoidMode > 0) {
+    if (avoidMode === 1 || avoidMode === 2) {
       const mvx = this.cvx, mvy = this.cvy;                                  // سرعتي
       for (const o of others) {
         if (o === this) continue;
@@ -244,6 +356,9 @@ class Plane {
           }
         }
       }
+    } else if (avoidMode === 3) {                          // ORCA: نأخذ اتجاه السرعة الآمنة المحسوبة
+      const r = orcaVelocity(this, others, dt, vx, vy);
+      if (r && (r[0] || r[1])) { vx = r[0]; vy = r[1]; }
     }
     const want = Math.atan2(vy, vx);   // الاتجاه المطلوب بعد دمج الوجهة والتفادي
     let diff = want - this.heading;
@@ -312,7 +427,7 @@ const $ = id => document.getElementById(id);
 const M = () => Math.max(0.0001, +$('scale').value || 1);   // متر لكل بكسل (للعرض فقط، لا يغيّر الحركة)
 
 $('avoid').onclick = e => {
-  avoidMode = (avoidMode + 1) % 3;
+  avoidMode = (avoidMode + 1) % 4;
   e.target.textContent = 'تفادي: ' + MODE_NAMES[avoidMode];
 };
 $('reset').onclick = () => { live = newMetrics(true); planes.forEach(p => p.reached = 0); };
@@ -433,7 +548,7 @@ let cancelFlag = false;
 async function runJobs(jobs) {
   cancelFlag = false;
   $('progressBox').hidden = false;
-  ['runExp', 'runDensity', 'runSens'].forEach(id => $(id).disabled = true);
+  ['runExp', 'runDensity', 'runSens', 'runPred'].forEach(id => $(id).disabled = true);
   const out = []; let last = performance.now();
   for (let i = 0; i < jobs.length && !cancelFlag; i++) {
     out.push(jobs[i]());
@@ -445,7 +560,7 @@ async function runJobs(jobs) {
     }
   }
   $('progressBox').hidden = true;
-  ['runExp', 'runDensity', 'runSens'].forEach(id => $(id).disabled = false);
+  ['runExp', 'runDensity', 'runSens', 'runPred'].forEach(id => $(id).disabled = false);
   return cancelFlag ? null : out;
 }
 $('cancelExp').onclick = () => { cancelFlag = true; };
@@ -455,7 +570,7 @@ $('runExp').onclick = async () => {
   const { nP, nD, sec, runs } = readInputs();
   const meta = [], jobs = [];
   for (let seed = 1; seed <= runs; seed++)
-    for (const mode of [0, 1, 2]) { meta.push({ seed, mode }); jobs.push(() => runOnce(seed, mode, nP, nD, sec)); }
+    for (const mode of ALL_MODES) { meta.push({ seed, mode }); jobs.push(() => runOnce(seed, mode, nP, nD, sec)); }
   const res = await runJobs(jobs);
   if (!res) return;
   const rows = res.map((r, i) => ({ ...meta[i], ...r }));
@@ -466,7 +581,7 @@ $('runExp').onclick = async () => {
              ' | ' + sec + ' ث × ' + runs + ' تكرارات (المتوسط ± الانحراف المعياري)</p>' +
              '<table><tr><th>المقياس</th>' + MODE_NAMES.map(n => '<th>' + n + '</th>').join('') + '</tr>';
   for (const [k, label] of metrics) {
-    const cols = [0, 1, 2].map(m => rows.filter(r => r.mode === m).map(r => k === 'minDist' ? r[k] * M() : r[k]));
+    const cols = ALL_MODES.map(m => rows.filter(r => r.mode === m).map(r => k === 'minDist' ? r[k] * M() : r[k]));
     html += '<tr><td>' + label + '</td>' + cols.map(c => '<td>' + fmt(c) + '</td>').join('') + '</tr>';
   }
   $('results').innerHTML = html + '</table>';
@@ -481,7 +596,7 @@ $('runDensity').onclick = async () => {
   for (const n of counts) {
     const nP = Math.round(n * 0.3), nD = n - nP;
     for (let seed = 1; seed <= runs; seed++)
-      for (const mode of [0, 1, 2]) { meta.push({ n, seed, mode }); jobs.push(() => runOnce(seed, mode, nP, nD, sec)); }
+      for (const mode of ALL_MODES) { meta.push({ n, seed, mode }); jobs.push(() => runOnce(seed, mode, nP, nD, sec)); }
   }
   const res = await runJobs(jobs);
   if (!res) return;
@@ -493,8 +608,8 @@ $('runDensity').onclick = async () => {
              MODE_NAMES.map(n => '<th>وجهات: ' + n + '</th>').join('') + '</tr>';
   for (const n of counts) {
     const sel = m => rows.filter(r => r.n === n && r.mode === m);
-    html += '<tr><td>' + n + '</td>' + [0, 1, 2].map(m => '<td>' + mean(sel(m).map(r => r.crashes)).toFixed(1) + '</td>').join('') +
-            [0, 1, 2].map(m => '<td>' + mean(sel(m).map(r => r.reached)).toFixed(1) + '</td>').join('') + '</tr>';
+    html += '<tr><td>' + n + '</td>' + ALL_MODES.map(m => '<td>' + mean(sel(m).map(r => r.crashes)).toFixed(1) + '</td>').join('') +
+            ALL_MODES.map(m => '<td>' + mean(sel(m).map(r => r.reached)).toFixed(1) + '</td>').join('') + '</tr>';
   }
   $('results').innerHTML = html + '</table>';
   lastExport = { name: 'aircore-density.csv', header: 'count,seed,mode,crashes,nearMiss,reached,minDist,minDist_m',
@@ -636,7 +751,7 @@ $('scnAll').onclick = () => {
   let html = '<table><tr><th>السيناريو</th>' + MODE_NAMES.map(n => '<th>' + n + '</th>').join('') + '</tr>';
   for (const k of Object.keys(SCENARIOS)) {
     html += '<tr><td>' + SCENARIOS[k].name + '</td>';
-    for (const mode of [0, 1, 2]) {
+    for (const mode of ALL_MODES) {
       const r = runScenario(k, mode);
       const status = r.crashes > 0 ? 'تصادم' : r.done ? 'نجح' : 'لم يكتمل';
       html += '<td>' + status + '<br>أقرب ' + (r.minDist * M()).toFixed(0) + ' م' +
@@ -916,6 +1031,154 @@ function drawWindow() {
 }
 
 loadSudan();
+
+// ===== دقة التنبؤ والكشف =====
+// نسجّل مواضع كل مركبة كل 0.1 ث، ثم نقارن «ما توقعناه» (استقراء خطي بالسرعة الحالية) بما حدث فعلاً.
+function runPredict(seed, mode, nPlanes, nDrones, seconds) {
+  const savedRng = rng, savedMode = avoidMode;
+  rng = mulberry32(seed); avoidMode = mode;
+  const fleet = [];
+  for (let i = 0; i < nPlanes; i++) fleet.push(new Plane('plane'));
+  for (let i = 0; i < nDrones; i++) fleet.push(new Plane('drone'));
+  const steps = Math.round(seconds * 60), n = fleet.length;
+  const X = fleet.map(() => []), Y = fleet.map(() => []), VX = fleet.map(() => []), VY = fleet.map(() => []);
+  for (let st = 0; st < steps; st++) {
+    for (const p of fleet) p.syncVel();
+    if (st % 6 === 0) fleet.forEach((p, i) => { X[i].push(p.x); Y[i].push(p.y); VX[i].push(p.cvx); VY[i].push(p.cvy); });
+    for (const p of fleet) p.update(1 / 60, fleet);
+  }
+  rng = savedRng; avoidMode = savedMode;
+  const N = n ? X[0].length : 0, HZ = [5, 10, 20], err = HZ.map(() => [0, 0]);
+  for (let i = 0; i < n; i++) for (let k = 0; k < N; k += 10) HZ.forEach((h, q) => {      // خطأ الموضع المتوقع بعد h ثانية
+    const kk = k + h * 10; if (kk >= N) return;
+    err[q][0] += Math.hypot(X[i][k] + VX[i][k] * h - X[i][kk], Y[i][k] + VY[i][k] * h - Y[i][kk]); err[q][1]++;
+  });
+  let tp = 0, fp = 0, fn = 0; const H = 10, W2 = WARN2;                                   // إنذار: اقتراب أقل من 70 بكسل خلال 10 ث
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) for (let k = 0; k + H * 10 < N; k += 20) {
+    const rx = X[j][k] - X[i][k], ry = Y[j][k] - Y[i][k], rvx = VX[j][k] - VX[i][k], rvy = VY[j][k] - VY[i][k], vv = rvx * rvx + rvy * rvy;
+    let t = vv > 1e-9 ? -(rx * rvx + ry * rvy) / vv : 0; t = Math.max(0, Math.min(H, t));
+    const cx = rx + rvx * t, cy = ry + rvy * t, predicted = cx * cx + cy * cy < W2;
+    let actual = false;
+    for (let m = k; m <= k + H * 10; m++) { const dx = X[j][m] - X[i][m], dy = Y[j][m] - Y[i][m]; if (dx * dx + dy * dy < W2) { actual = true; break; } }
+    if (predicted && actual) tp++; else if (predicted) fp++; else if (actual) fn++;
+  }
+  return { err: err.map(e => e[1] ? e[0] / e[1] : 0), tp, fp, fn };
+}
+
+$('runPred').onclick = async () => {
+  const { nP, nD, sec, runs } = readInputs();
+  const meta = [], jobs = [];
+  for (let seed = 1; seed <= runs; seed++) for (const mode of ALL_MODES) { meta.push({ seed, mode }); jobs.push(() => runPredict(seed, mode, nP, nD, sec)); }
+  const res = await runJobs(jobs);
+  if (!res) return;
+  const rows = res.map((r, i) => ({ ...meta[i], ...r }));
+  const per = m => rows.filter(r => r.mode === m);
+  const errRow = q => ALL_MODES.map(m => '<td>' + (mean(per(m).map(r => r.err[q])) * M()).toFixed(1) + '</td>').join('');
+  const sum = (m, k) => per(m).reduce((a, r) => a + r[k], 0);
+  const pct = (a, b) => b ? (100 * a / b).toFixed(0) + '%' : '-';
+  let html = '<p>طائرات: ' + nP + ' | مسيّرات: ' + nD + ' | ' + sec + ' ث × ' + runs + ' تكرارات | الأخطاء بالمتر (1 بكسل = ' + M() + ' م). إنذار التعارض: اقتراب أقل من ' + Math.round(WARN * M()) + ' م خلال 10 ث.</p>' +
+    '<table><tr><th>المقياس</th>' + MODE_NAMES.map(n => '<th>' + n + '</th>').join('') + '</tr>' +
+    '<tr><td>خطأ الموضع المتوقع بعد 5 ث (م)</td>' + errRow(0) + '</tr>' +
+    '<tr><td>خطأ الموضع المتوقع بعد 10 ث (م)</td>' + errRow(1) + '</tr>' +
+    '<tr><td>خطأ الموضع المتوقع بعد 20 ث (م)</td>' + errRow(2) + '</tr>' +
+    '<tr><td>الدقة: من إنذاراتنا كم تحقق</td>' + ALL_MODES.map(m => '<td>' + pct(sum(m, 'tp'), sum(m, 'tp') + sum(m, 'fp')) + '</td>').join('') + '</tr>' +
+    '<tr><td>الاستدعاء: من الاقترابات الفعلية كم أنذرنا به</td>' + ALL_MODES.map(m => '<td>' + pct(sum(m, 'tp'), sum(m, 'tp') + sum(m, 'fn')) + '</td>').join('') + '</tr></table>' +
+    '<p>تنبيه: في أنماط التفادي، الإنذار الذي ينجح التفادي في منع خطره يظهر كإنذار كاذب. فالقياس العادل لدقة التنبؤ نفسه هو عمود «بدون تفادٍ».</p>';
+  $('results').innerHTML = html;
+  lastExport = { name: 'aircore-prediction.csv', header: 'seed,mode,err5_px,err10_px,err20_px,tp,fp,fn',
+    lines: rows.map(r => [r.seed, MODE_EN[r.mode], ...r.err.map(e => e.toFixed(2)), r.tp, r.fp, r.fn].join(',')) };
+};
+
+// ===== اختبارات التحقق الآلية =====
+// كل اختبار: [الاسم، المتوقع، دالة تعيد [نجح؟، تفاصيل]]. تعمل بدون رسم وبنتائج ثابتة.
+const physPlane = (prof, x, y, h, tx, ty) => { const p = new Plane(prof.type, prof); Object.assign(p, { x, y, heading: h, tx, ty, trail: [] }); return p; };
+const wrapAng = a => Math.atan2(Math.sin(a), Math.cos(a));
+function crashesOver(mode, seeds, secs) { let c = 0; for (let sd = 1; sd <= seeds; sd++) c += runOnce(sd, mode, 3, 8, secs).crashes; return c; }
+const TESTS = [];
+for (const k of Object.keys(SCENARIOS)) for (const m of ALL_MODES) {
+  TESTS.push([SCENARIOS[k].name + ' — ' + MODE_NAMES[m], m === 0 ? 'يجب أن يحدث تصادم' : 'بلا تصادم وتبلغ المركبات وجهتها', () => {
+    const r = runScenario(k, m);
+    const ok = m === 0 ? r.crashes > 0 : (r.crashes === 0 && r.done);
+    return [ok, (r.crashes ? r.crashes + ' تصادم' : 'بلا تصادم') + '، أقرب ' + Math.round(r.minDist * M()) + ' م' + (r.done || m === 0 ? '' : '، لم تكتمل')];
+  }]);
+}
+TESTS.push(
+  ['المسيّرة المحوِّمة لا تتحرك', 'موضعها لا يتغير', () => {
+    const d = mk('drone', 200, 200, 0, 40, 200, 200); d.wait = 1e9;
+    for (let i = 0; i < 300; i++) { d.syncVel(); d.update(1 / 60, [d]); }
+    return [d.x === 200 && d.y === 200, 'الموضع (' + d.x + '، ' + d.y + ')'];
+  }],
+  ['التصادم يُعدّ مرة واحدة', 'عدّاد التصادمات = 1', () => {
+    const f = [mk('plane', 100, 100, 0, 0, 100, 100), mk('plane', 105, 100, 0, 0, 105, 100)], m = newMetrics();
+    for (let i = 0; i < 100; i++) scan(f, m);
+    return [m.crashes === 1, m.crashes + ' بعد 100 فحص'];
+  }],
+  ['عتبتا NMAC وLoWC للطراز الواقعي', '100 م: تصادم، 400 م: اقتراب فقط، 800 م: لا شيء', () => {
+    MPP = 8; const c = PROFILES.c172, out = [];
+    for (const d of [100, 400, 800]) { const f = [physPlane(c, 100, 100, 0, 100, 100), physPlane(c, 100 + d / MPP, 100, 0, 100, 100)], m = newMetrics(); scan(f, m); out.push([m.crashes, m.warnNow]); }
+    return [out[0][0] === 1 && out[1][0] === 0 && out[1][1] === 1 && out[2][0] === 0 && out[2][1] === 0, out.map(o => o.join('/')).join(' | ')];
+  }],
+  ['سرعة Cessna تساوي 63.8 م/ث', 'السرعة بالمتر = 124 عقدة', () => {
+    MPP = 8; const p = new Plane('plane', PROFILES.c172); p.syncVel(); const v = p.speed * MPP;
+    return [Math.abs(v - 124 * KT) < 0.01, v.toFixed(2) + ' م/ث'];
+  }],
+  ['حد دوران Cessna عند الكروز = 3°/ث', 'Rate One هو الأقل', () => {
+    const w = new Plane('plane', PROFILES.c172).turnLimit() / DEG; return [Math.abs(w - 3) < 0.01, w.toFixed(2) + '°/ث'];
+  }],
+  ['حد الدوران يتبع g·tan(25°)÷V عند السرعة العالية', 'عند 100 م/ث: 2.62°/ث', () => {
+    const p = new Plane('plane', PROFILES.c172); p.vms = 100; const w = p.turnLimit() / DEG; return [Math.abs(w - 2.62) < 0.02, w.toFixed(2) + '°/ث'];
+  }],
+  ['الطائرة لا تتجاوز حد الدوران', 'أقصى معدل ≤ 3°/ث، وتدور نحو 60° خلال 20 ث', () => {
+    MPP = 8; avoidMode = 0; const p = physPlane(PROFILES.c172, 600, 300, 0, 0, 300), dt = 1 / 30; let prev = p.heading, mx = 0, total = 0;
+    for (let i = 0; i < 600; i++) { p.syncVel(); p.update(dt, [p]); const d = wrapAng(p.heading - prev); total += Math.abs(d); mx = Math.max(mx, Math.abs(d) / dt); prev = p.heading; }
+    return [mx <= 3 * DEG * 1.001 && total > 55 * DEG && total < 61 * DEG, 'أقصى معدل ' + (mx / DEG).toFixed(2) + '°/ث، الدوران الكلي ' + (total / DEG).toFixed(1) + '°'];
+  }],
+  ['المسيّرة أرشق من الطائرة', 'حد دوران Mavic أكبر من Cessna بأكثر من 5 أضعاف', () => {
+    const a = new Plane('drone', PROFILES.mavic3).turnLimit(), b = new Plane('plane', PROFILES.c172).turnLimit();
+    return [a > 5 * b, (a / DEG).toFixed(1) + ' مقابل ' + (b / DEG).toFixed(1) + '°/ث'];
+  }],
+  ['TCPA وDCPA صحيحان', 'بعد 5 ث وعلى 30 بكسل', () => {
+    const a = mk('plane', 0, 0, 0, 10, 1e6, 0), b = mk('plane', 100, 30, Math.PI, 10, -1e6, 30); a.cvx = 10; a.cvy = 0; b.cvx = -10; b.cvy = 0;
+    const m = newMetrics(true); scan([a, b], m); const w = m.worst;
+    return [!!w && Math.abs(w.t - 5) < 1e-6 && Math.abs(w.dcpa - 30) < 1e-6, w ? 'TCPA ' + w.t.toFixed(3) + ' ث، DCPA ' + w.dcpa.toFixed(3) : 'لا نتيجة'];
+  }],
+  ['التنبؤ الخطي دقيق للمسار المستقيم', 'خطأ أقل من بكسل بعد 10 ث', () => {
+    avoidMode = 0; const p = mk('plane', 100, 300, 0, 90, 1e7, 300); p.syncVel(); const px = p.x + p.cvx * 10;
+    for (let i = 0; i < 600; i++) { p.syncVel(); p.update(1 / 60, [p]); }
+    return [Math.abs(px - p.x) < 1, 'الفرق ' + Math.abs(px - p.x).toFixed(3) + ' بكسل'];
+  }],
+  ['إعادة التشغيل بنفس البذرة تعطي النتائج نفسها', 'نتيجتان متطابقتان', () => {
+    const a = JSON.stringify(runOnce(7, 2, 3, 8, 20)), b = JSON.stringify(runOnce(7, 2, 3, 8, 20)); return [a === b, a === b ? 'متطابقتان' : 'مختلفتان'];
+  }],
+  ['التفادي التنبؤي يقلل التصادمات إحصائياً', 'أقل من 30% مما بدون تفادٍ (4 بذور)', () => {
+    const c0 = crashesOver(0, 4, 40), c2 = crashesOver(2, 4, 40); return [c2 <= 0.3 * c0, c0 + ' ← ' + c2];
+  }],
+  ['ORCA يقلل التصادمات إحصائياً', 'أقل من 30% مما بدون تفادٍ (4 بذور)', () => {
+    const c0 = crashesOver(0, 4, 40), c3 = crashesOver(3, 4, 40); return [c3 <= 0.3 * c0, c0 + ' ← ' + c3];
+  }],
+);
+for (const m of [0, 2, 3]) TESTS.push(['Cessna وجهاً لوجه (طراز واقعي) — ' + MODE_NAMES[m], m === 0 ? 'يجب أن يحدث NMAC' : 'بلا NMAC (153 م)', () => {
+  MPP = 8; avoidMode = m; const c = PROFILES.c172, f = [physPlane(c, 120, 310, 0, 1080, 310), physPlane(c, 1080, 313, Math.PI, 120, 313)], mt = newMetrics(), dt = 1 / 30;
+  for (let i = 0; i < 200 * 30; i++) { for (const p of f) p.syncVel(); for (const p of f) p.update(dt, f); scan(f, mt); }
+  return [m === 0 ? mt.crashes > 0 : mt.crashes === 0, 'أقرب ' + Math.round(mt.minDist * MPP) + ' م'];
+}]);
+
+$('runTests').onclick = () => {
+  $('testSummary').textContent = 'جارٍ التشغيل...';
+  setTimeout(() => {
+    const saved = { mpp: MPP, mode: avoidMode, rng };
+    let pass = 0, html = '<table><tr><th>#</th><th>الاختبار</th><th>المتوقع</th><th>النتيجة</th><th>التفاصيل</th></tr>';
+    TESTS.forEach(([name, expect, fn], i) => {
+      let ok = false, detail = '';
+      try { [ok, detail] = fn(); } catch (err) { detail = 'خطأ: ' + err.message; }
+      MPP = saved.mpp; avoidMode = saved.mode; rng = saved.rng;                  // نعيد الحالة بعد كل اختبار
+      if (ok) pass++;
+      html += '<tr><td>' + (i + 1) + '</td><td>' + name + '</td><td>' + expect + '</td><td>' + (ok ? '✓ نجح' : '✗ فشل') + '</td><td>' + detail + '</td></tr>';
+    });
+    $('testResults').innerHTML = html + '</table>';
+    $('testSummary').textContent = 'نجح ' + pass + ' من ' + TESTS.length;
+  }, 30);
+};
 
 // ===== الطرازات الواقعية وتسريع الزمن =====
 function profOf(type) { const v = $(type === 'plane' ? 'profPlane' : 'profDrone').value; return v === 'generic' ? null : PROFILES[v]; }
